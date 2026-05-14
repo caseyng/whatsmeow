@@ -24,7 +24,9 @@ CREATE TABLE whatsmeow_device (
 	business_name TEXT NOT NULL DEFAULT '',
 	push_name     TEXT NOT NULL DEFAULT '',
 
-	lid_migration_ts BIGINT NOT NULL DEFAULT 0
+	lid_migration_ts BIGINT NOT NULL DEFAULT 0,
+
+	signed_pre_key_timestamp BIGINT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE whatsmeow_identity_keys (

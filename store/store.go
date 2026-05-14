@@ -233,6 +233,8 @@ type Device struct {
 
 	LIDMigrationTimestamp int64
 
+	SignedPreKeyTimestamp time.Time
+
 	FacebookUUID uuid.UUID
 
 	Initialized   bool

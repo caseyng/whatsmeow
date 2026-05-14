@@ -29,6 +29,10 @@ const (
 	// MinPreKeyCount is the number of prekeys when the client will upload a new batch of prekeys to the WhatsApp servers.
 	// 10 matches the refill trigger threshold used by all official clients (arxiv 2504.07323, Table 4).
 	MinPreKeyCount = 10
+
+	// signedPreKeyRotationPeriod is how long before the signed prekey is rotated.
+	// Official WhatsApp clients rotate approximately monthly for forward secrecy.
+	signedPreKeyRotationPeriod = 30 * 24 * time.Hour
 )
 
 func (cli *Client) getServerPreKeyCount(ctx context.Context) (int, error) {
@@ -49,6 +53,32 @@ func (cli *Client) getServerPreKeyCount(ctx context.Context) (int, error) {
 	return val, ag.Error()
 }
 
+// maybeRotateSignedPreKey rotates the signed prekey if it is older than signedPreKeyRotationPeriod.
+// On the first call after an upgrade (SignedPreKeyTimestamp is zero), the timestamp is recorded
+// without regenerating the key — it was already uploaded during registration.
+func (cli *Client) maybeRotateSignedPreKey(ctx context.Context) {
+	now := time.Now()
+	if cli.Store.SignedPreKeyTimestamp.IsZero() {
+		cli.Store.SignedPreKeyTimestamp = now
+		if err := cli.Store.Save(ctx); err != nil {
+			cli.Log.Warnf("Failed to save signed prekey timestamp: %v", err)
+		}
+		return
+	}
+	if now.Sub(cli.Store.SignedPreKeyTimestamp) < signedPreKeyRotationPeriod {
+		return
+	}
+	cli.Log.Infof("Rotating signed prekey (age: %v)", now.Sub(cli.Store.SignedPreKeyTimestamp).Round(time.Hour))
+	newKey := cli.Store.IdentityKey.CreateSignedPreKey(cli.Store.SignedPreKey.KeyID + 1)
+	cli.Store.SignedPreKey = newKey
+	cli.Store.SignedPreKeyTimestamp = now
+	if err := cli.Store.Save(ctx); err != nil {
+		cli.Log.Errorf("Failed to save rotated signed prekey: %v", err)
+		return
+	}
+	cli.Log.Debugf("Signed prekey rotated to ID %d, uploading with next prekey batch", newKey.KeyID)
+}
+
 func (cli *Client) uploadPreKeys(ctx context.Context, initialUpload bool) {
 	cli.uploadPreKeysLock.Lock()
 	defer cli.uploadPreKeysLock.Unlock()
@@ -61,6 +91,9 @@ func (cli *Client) uploadPreKeys(ctx context.Context, initialUpload bool) {
 	}
 	var registrationIDBytes [4]byte
 	binary.BigEndian.PutUint32(registrationIDBytes[:], cli.Store.RegistrationID)
+	if !initialUpload {
+		cli.maybeRotateSignedPreKey(ctx)
+	}
 	wantedCount := WantedPreKeyCount
 	if initialUpload {
 		wantedCount = 812
