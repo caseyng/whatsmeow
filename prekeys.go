@@ -24,9 +24,11 @@ import (
 
 const (
 	// WantedPreKeyCount is the number of prekeys that the client should upload to the WhatsApp servers in a single batch.
-	WantedPreKeyCount = 50
+	// 812 matches the refill batch size used by official Android and iOS clients (arxiv 2504.07323, Table 4).
+	WantedPreKeyCount = 812
 	// MinPreKeyCount is the number of prekeys when the client will upload a new batch of prekeys to the WhatsApp servers.
-	MinPreKeyCount = 5
+	// 10 matches the refill trigger threshold used by all official clients (arxiv 2504.07323, Table 4).
+	MinPreKeyCount = 10
 )
 
 func (cli *Client) getServerPreKeyCount(ctx context.Context) (int, error) {

@@ -122,10 +122,10 @@ var BaseClientPayload = &waWa6.ClientPayload{
 }
 
 var DeviceProps = &waCompanionReg.DeviceProps{
-	Os: proto.String("whatsmeow"),
+	Os: proto.String("Chrome"),
 	Version: &waCompanionReg.DeviceProps_AppVersion{
-		Primary:   proto.Uint32(0),
-		Secondary: proto.Uint32(1),
+		Primary:   proto.Uint32(124),
+		Secondary: proto.Uint32(0),
 		Tertiary:  proto.Uint32(0),
 	},
 	HistorySyncConfig: &waCompanionReg.DeviceProps_HistorySyncConfig{
@@ -152,7 +152,7 @@ var DeviceProps = &waCompanionReg.DeviceProps{
 		SupportManusHistory:                      proto.Bool(true),
 		SupportHatchHistory:                      proto.Bool(true),
 	},
-	PlatformType:    waCompanionReg.DeviceProps_UNKNOWN.Enum(),
+	PlatformType:    waCompanionReg.DeviceProps_CHROME.Enum(),
 	RequireFullSync: proto.Bool(false),
 }
 
