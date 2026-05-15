@@ -1,5 +1,8 @@
 # whatsmeow — fingerprinting-hardened fork
 
+> **The fork's changes are on the [`whatsbot-fingerprint-hardening`](../../tree/whatsbot-fingerprint-hardening) branch, not `main`.**
+> Clone with: `git clone -b whatsbot-fingerprint-hardening https://github.com/caseyng/whatsmeow.git`
+
 A fork of [tulir/whatsmeow](https://github.com/tulir/whatsmeow) that reduces the fingerprinting surface of the library when used as a WhatsApp companion device. Full credit and gratitude to [Tulir Asokan](https://github.com/tulir) for the original library.
 
 ---
