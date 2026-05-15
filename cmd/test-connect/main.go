@@ -28,6 +28,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -48,6 +49,7 @@ var (
 	readonly       = flag.Bool("readonly", false, "Don't send test message on connect")
 	autoDisconnect = flag.Bool("auto-disconnect", false, "Disconnect 30s after last history sync event")
 	unpairOnExit   = flag.Bool("unpair", false, "Unpair linked device on exit")
+	backfillChat   = flag.String("backfill-chat", "", "Fetch all available history for this chat JID")
 	chats          chatFilter
 )
 
@@ -114,7 +116,8 @@ func main() {
 	client.SetWebsocketHTTPClient(chrome)
 	client.SetPreLoginHTTPClient(chrome)
 
-	connected := make(chan struct{}, 1)
+	connected   := make(chan struct{}, 1)
+	onDemandCh  := make(chan int, 1) // backfill loop: messages returned per ON_DEMAND batch
 	var (
 		syncTimer *time.Timer
 		syncMu    sync.Mutex
@@ -181,10 +184,11 @@ func main() {
 				v.Info.Sender.User, v.Info.Chat.String(), body)
 
 		case *events.HistorySync:
+			isOnDemand := v.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND
 			syncType := v.Data.GetSyncType().String()
 			conversations := v.Data.GetConversations()
 			fmt.Printf("\nHistorySync [%s]: %d conversations\n", syncType, len(conversations))
-			stored := 0
+			stored, returned := 0, 0
 			for _, conv := range conversations {
 				chatJID := conv.GetID()
 				isGroup := strings.HasSuffix(chatJID, "@g.us")
@@ -199,12 +203,14 @@ func main() {
 				for _, p := range conv.GetParticipant() {
 					upsertGroupMember(rawDB, chatJID, p.GetUserJID(), p.GetRank().String())
 				}
-				if !wantChat(chatJID) {
-					continue
-				}
 				for _, msg := range conv.GetMessages() {
 					info := msg.GetMessage()
 					if info == nil {
+						continue
+					}
+					returned++
+					// ON_DEMAND responses bypass the --chat filter: we asked for this chat explicitly.
+					if !isOnDemand && !wantChat(chatJID) {
 						continue
 					}
 					msgID := info.GetKey().GetID()
@@ -232,6 +238,12 @@ func main() {
 			}
 			fmt.Printf("Stored %d messages.\n", stored)
 			resetSyncTimer()
+			if isOnDemand {
+				select {
+				case onDemandCh <- returned:
+				default:
+				}
+			}
 		}
 	})
 
@@ -277,6 +289,53 @@ func main() {
 			}
 			_ = client.SendChatPresence(context.Background(), selfJID,
 				types.ChatPresencePaused, "")
+		}()
+	}
+
+	if *backfillChat != "" {
+		go func() {
+			select {
+			case <-connected:
+			case <-time.After(5 * time.Minute):
+				fmt.Println("Backfill: timed out waiting for connection")
+				return
+			}
+			// Give the initial reconnect sync a moment to settle.
+			time.Sleep(3 * time.Second)
+			fmt.Printf("Backfill: starting history fetch for %s\n", *backfillChat)
+			total := 0
+			for {
+				info, err := oldestMessageInfo(rawDB, *backfillChat)
+				if err == sql.ErrNoRows {
+					fmt.Println("Backfill: no messages in DB for this chat yet — waiting for initial sync")
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				if err != nil {
+					fmt.Printf("Backfill: DB error: %v\n", err)
+					return
+				}
+				fmt.Printf("Backfill: requesting 50 messages before [%s] @ %s\n",
+					info.ID, info.Timestamp.Format("2006-01-02 15:04:05"))
+				req := client.BuildHistorySyncRequest(&info, 50)
+				if _, err := client.SendPeerMessage(context.Background(), req); err != nil {
+					fmt.Printf("Backfill: send failed: %v\n", err)
+					return
+				}
+				select {
+				case n := <-onDemandCh:
+					total += n
+					if n == 0 {
+						fmt.Printf("Backfill: complete — %d total messages fetched for %s\n", total, *backfillChat)
+						printCount(rawDB, dbPath)
+						return
+					}
+					fmt.Printf("Backfill: +%d messages (running total: %d)\n", n, total)
+				case <-time.After(30 * time.Second):
+					fmt.Println("Backfill: timed out waiting for ON_DEMAND response")
+					return
+				}
+			}
 		}()
 	}
 
@@ -494,4 +553,31 @@ func printCount(db *sql.DB, dbFile string) {
 	var count int
 	_ = db.QueryRow("SELECT COUNT(*) FROM wa_messages").Scan(&count)
 	fmt.Printf("Messages stored in %s: %d\n", dbFile, count)
+}
+
+// oldestMessageInfo returns a MessageInfo for the oldest message stored for a
+// given chat JID. Used by the backfill loop to request older history.
+func oldestMessageInfo(db *sql.DB, chatJID string) (types.MessageInfo, error) {
+	var id string
+	var ts int64
+	var isFromMe int
+	err := db.QueryRow(`
+		SELECT id, timestamp, is_from_me FROM wa_messages
+		WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1`, chatJID).
+		Scan(&id, &ts, &isFromMe)
+	if err != nil {
+		return types.MessageInfo{}, err
+	}
+	jid, err := types.ParseJID(chatJID)
+	if err != nil {
+		return types.MessageInfo{}, err
+	}
+	return types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     jid,
+			IsFromMe: isFromMe == 1,
+		},
+		ID:        id,
+		Timestamp: time.Unix(ts, 0),
+	}, nil
 }
