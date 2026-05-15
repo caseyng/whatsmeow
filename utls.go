@@ -35,6 +35,27 @@ func NewChromeHTTPClient() *http.Client {
 					return nil, err
 				}
 				uconn := utls.UClient(conn, &utls.Config{ServerName: host}, utls.HelloChrome_Auto)
+
+				// Build the ClientHello from the Chrome spec so we can inspect
+				// the extension list before the handshake.
+				if err := uconn.BuildHandshakeState(); err != nil {
+					conn.Close()
+					return nil, err
+				}
+
+				// Chrome's spec includes h2+http/1.1 in ALPN. Go's http.Transport
+				// with a custom DialTLSContext has no h2 support, so when the server
+				// selects h2 it sends binary HTTP/2 frames that the transport reads
+				// as a broken HTTP/1.x response. Fix: patch the ALPN extension object
+				// to http/1.1 only. ApplyConfig (called during handshake) will
+				// propagate this value into the wire hello.
+				for _, ext := range uconn.Extensions {
+					if alpn, ok := ext.(*utls.ALPNExtension); ok {
+						alpn.AlpnProtocols = []string{"http/1.1"}
+						break
+					}
+				}
+
 				if err := uconn.HandshakeContext(ctx); err != nil {
 					conn.Close()
 					return nil, err

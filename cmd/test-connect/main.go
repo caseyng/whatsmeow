@@ -6,10 +6,10 @@
 //
 // Flags:
 //
-//	--db <file>          SQLite file (default: test-connect.db)
+//	--db <file>          SQLite file (default: <phone>.db). One file per account.
 //	--readonly           Don't send a test message on connect
 //	--chat <jid>         Only store messages from this chat JID (repeatable)
-//	--auto-disconnect    Disconnect automatically when history sync completes
+//	--auto-disconnect    Disconnect automatically 30s after last history sync event
 //	--unpair             Unpair (remove linked device) instead of just disconnecting
 package main
 
@@ -44,10 +44,10 @@ func (f *chatFilter) Set(v string) error {
 }
 
 var (
-	dbFile         = flag.String("db", "test-connect.db", "SQLite file path")
+	dbFile         = flag.String("db", "", "SQLite file (default: <phone>.db). One file per account.")
 	readonly       = flag.Bool("readonly", false, "Don't send test message on connect")
-	autoDisconnect = flag.Bool("auto-disconnect", false, "Disconnect when history sync completes")
-	unpair         = flag.Bool("unpair", false, "Unpair linked device on exit")
+	autoDisconnect = flag.Bool("auto-disconnect", false, "Disconnect 30s after last history sync event")
+	unpairOnExit   = flag.Bool("unpair", false, "Unpair linked device on exit")
 	chats          chatFilter
 )
 
@@ -62,22 +62,28 @@ func main() {
 	}
 	phone := flag.Arg(0)
 
-	msgDB, err := sql.Open("sqlite3", "file:"+*dbFile+"?_foreign_keys=on")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to open message db: %v\n", err)
-		os.Exit(1)
-	}
-	defer msgDB.Close()
-	if err := initMessageDB(msgDB); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to init message db: %v\n", err)
-		os.Exit(1)
+	dbPath := *dbFile
+	if dbPath == "" {
+		dbPath = phone + ".db"
 	}
 
-	logger := waLog.Stdout("Client", "INFO", true)
-	container, err := sqlstore.New(context.Background(), "sqlite3",
-		"file:"+*dbFile+"?_foreign_keys=on", waLog.Stdout("DB", "ERROR", true))
+	// Open the SQLite file once — whatsmeow session tables and wa_messages
+	// share the same connection so there is no double-open or locking conflict.
+	rawDB, err := sql.Open("sqlite3", "file:"+dbPath+"?_foreign_keys=on")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to open store: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to open db %s: %v\n", dbPath, err)
+		os.Exit(1)
+	}
+	defer rawDB.Close()
+
+	dbLogger := waLog.Stdout("DB", "ERROR", true)
+	container := sqlstore.NewWithDB(rawDB, "sqlite3", dbLogger)
+	if err := container.Upgrade(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to upgrade db: %v\n", err)
+		os.Exit(1)
+	}
+	if err := initMessageTable(rawDB); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to init message table: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -87,16 +93,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Guard against session/number mismatch — catch the case where the user
+	// points at an existing DB that belongs to a different number.
+	if device.ID != nil && device.ID.User != phone {
+		fmt.Fprintf(os.Stderr,
+			"ERROR: %s already has a session for %s, not %s.\n"+
+				"Use --db with a different filename for a different number.\n",
+			dbPath, device.ID.User, phone)
+		os.Exit(1)
+	}
+
+	logger := waLog.Stdout("Client", "INFO", true)
 	client := whatsmeow.NewClient(device, logger)
 
-	// Use Chrome TLS fingerprint
+	// Chrome TLS fingerprint on both pre-login and post-login connections
 	chrome := whatsmeow.NewChromeHTTPClient()
 	client.SetWebsocketHTTPClient(chrome)
 	client.SetPreLoginHTTPClient(chrome)
 
 	connected := make(chan struct{}, 1)
-	var syncTimer *time.Timer
-	var syncMu sync.Mutex
+	var (
+		syncTimer *time.Timer
+		syncMu    sync.Mutex
+	)
 
 	resetSyncTimer := func() {
 		if !*autoDisconnect {
@@ -108,8 +127,9 @@ func main() {
 			syncTimer.Reset(30 * time.Second)
 		} else {
 			syncTimer = time.AfterFunc(30*time.Second, func() {
-				fmt.Println("\nHistory sync idle — auto-disconnecting.")
+				fmt.Println("\nNo history sync activity for 30s — disconnecting.")
 				client.Disconnect()
+				printCount(rawDB, dbPath)
 				os.Exit(0)
 			})
 		}
@@ -131,20 +151,20 @@ func main() {
 			fmt.Println("\nLogged out.")
 
 		case *events.Message:
-			body, mediaType := extractBody(v.Message)
-			if wantChat(v.Info.Chat.String()) {
-				storeMessage(msgDB, v.Info.ID, v.Info.Chat.String(),
-					v.Info.Sender.String(), v.Info.Timestamp,
-					body, mediaType, v.Info.IsFromMe, v.Info.IsGroup)
-				fmt.Printf("[%s] MSG %s → %s: %s\n",
-					v.Info.Timestamp.Format("15:04:05"),
-					v.Info.Sender.User, v.Info.Chat.String(), body)
+			if !wantChat(v.Info.Chat.String()) {
+				return
 			}
+			body, mediaType := extractBody(v.Message)
+			storeMessage(rawDB, v.Info.ID, v.Info.Chat.String(),
+				v.Info.Sender.String(), v.Info.Timestamp,
+				body, mediaType, v.Info.IsFromMe, v.Info.IsGroup)
+			fmt.Printf("[%s] MSG %s → %s: %s\n",
+				v.Info.Timestamp.Format("15:04:05"),
+				v.Info.Sender.User, v.Info.Chat.String(), body)
 
 		case *events.HistorySync:
-			data := v.Data
-			syncType := data.GetSyncType().String()
-			conversations := data.GetConversations()
+			syncType := v.Data.GetSyncType().String()
+			conversations := v.Data.GetConversations()
 			fmt.Printf("\nHistorySync [%s]: %d conversations\n", syncType, len(conversations))
 			stored := 0
 			for _, conv := range conversations {
@@ -152,33 +172,31 @@ func main() {
 				if !wantChat(chatJID) {
 					continue
 				}
+				isGroup := strings.HasSuffix(chatJID, "@g.us")
 				for _, msg := range conv.GetMessages() {
 					info := msg.GetMessage()
 					if info == nil {
 						continue
 					}
-					msgProto := info.GetMessage()
-					body, mediaType := extractBody(msgProto)
+					body, mediaType := extractBody(info.GetMessage())
 					ts := time.Unix(int64(info.GetMessageTimestamp()), 0)
-					isGroup := strings.HasSuffix(chatJID, "@g.us")
-					isFromMe := info.GetKey().GetFromMe()
 					sender := info.GetKey().GetParticipant()
 					if sender == "" {
 						sender = info.GetKey().GetRemoteJID()
 					}
-					if storeMessage(msgDB, info.GetKey().GetID(), chatJID, sender,
-						ts, body, mediaType, isFromMe, isGroup) {
+					if storeMessage(rawDB, info.GetKey().GetID(), chatJID, sender,
+						ts, body, mediaType, info.GetKey().GetFromMe(), isGroup) {
 						stored++
 					}
 				}
 			}
-			fmt.Printf("Stored %d messages from history sync.\n", stored)
+			fmt.Printf("Stored %d messages.\n", stored)
 			resetSyncTimer()
 		}
 	})
 
 	if device.ID == nil {
-		fmt.Printf("No saved session — requesting pairing code for %s...\n", phone)
+		fmt.Printf("No session in %s — requesting pairing code for %s...\n", dbPath, phone)
 		if err := client.Connect(); err != nil {
 			fmt.Fprintf(os.Stderr, "connect error: %v\n", err)
 			os.Exit(1)
@@ -192,7 +210,7 @@ func main() {
 		fmt.Printf("\n============================\n  PAIRING CODE: %s\n============================\n", code)
 		fmt.Println("Enter in WhatsApp: Settings → Linked Devices → Link a Device → Link with Phone Number")
 	} else {
-		fmt.Printf("Resuming session for %s\n", device.ID)
+		fmt.Printf("Resuming session for %s (db: %s)\n", device.ID.User, dbPath)
 		if err := client.Connect(); err != nil {
 			fmt.Fprintf(os.Stderr, "connect error: %v\n", err)
 			os.Exit(1)
@@ -226,7 +244,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	<-sig
 
-	if *unpair {
+	if *unpairOnExit {
 		fmt.Println("\nUnpairing...")
 		if err := client.Logout(context.Background()); err != nil {
 			fmt.Printf("unpair error: %v\n", err)
@@ -236,12 +254,10 @@ func main() {
 		client.Disconnect()
 	}
 
-	count := 0
-	_ = msgDB.QueryRow("SELECT COUNT(*) FROM wa_messages").Scan(&count)
-	fmt.Printf("Messages stored in %s: %d\n", *dbFile, count)
+	printCount(rawDB, dbPath)
 }
 
-func initMessageDB(db *sql.DB) error {
+func initMessageTable(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS wa_messages (
 			id          TEXT PRIMARY KEY,
@@ -295,7 +311,8 @@ func extractBody(msg *waE2E.Message) (body, mediaType string) {
 	case msg.GetStickerMessage() != nil:
 		return "", "sticker"
 	case msg.GetLocationMessage() != nil:
-		return fmt.Sprintf("%.6f,%.6f", msg.GetLocationMessage().GetDegreesLatitude(),
+		return fmt.Sprintf("%.6f,%.6f",
+			msg.GetLocationMessage().GetDegreesLatitude(),
 			msg.GetLocationMessage().GetDegreesLongitude()), "location"
 	default:
 		return "", "other"
@@ -312,4 +329,10 @@ func wantChat(jid string) bool {
 		}
 	}
 	return false
+}
+
+func printCount(db *sql.DB, dbFile string) {
+	var count int
+	_ = db.QueryRow("SELECT COUNT(*) FROM wa_messages").Scan(&count)
+	fmt.Printf("Messages stored in %s: %d\n", dbFile, count)
 }
