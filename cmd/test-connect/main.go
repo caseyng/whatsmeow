@@ -69,7 +69,10 @@ func main() {
 
 	// Open the SQLite file once — whatsmeow session tables and wa_messages
 	// share the same connection so there is no double-open or locking conflict.
-	rawDB, err := sql.Open("sqlite3", "file:"+dbPath+"?_foreign_keys=on")
+	// WAL mode reduces write contention; busy_timeout makes SQLite retry for
+	// up to 5s instead of returning "database is locked" immediately.
+	rawDB, err := sql.Open("sqlite3",
+		"file:"+dbPath+"?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open db %s: %v\n", dbPath, err)
 		os.Exit(1)
