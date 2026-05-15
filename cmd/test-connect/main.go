@@ -172,10 +172,15 @@ func main() {
 			stored := 0
 			for _, conv := range conversations {
 				chatJID := conv.GetID()
+				isGroup := strings.HasSuffix(chatJID, "@g.us")
+				name := conv.GetName()
+				if name == "" {
+					name = conv.GetDisplayName()
+				}
+				upsertChat(rawDB, chatJID, name, isGroup)
 				if !wantChat(chatJID) {
 					continue
 				}
-				isGroup := strings.HasSuffix(chatJID, "@g.us")
 				for _, msg := range conv.GetMessages() {
 					info := msg.GetMessage()
 					if info == nil {
@@ -273,8 +278,23 @@ func initMessageTable(db *sql.DB) error {
 			is_group    INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_wamsg_chat ON wa_messages(chat_jid, timestamp);
+		CREATE TABLE IF NOT EXISTS wa_chats (
+			jid      TEXT PRIMARY KEY,
+			name     TEXT,
+			is_group INTEGER NOT NULL DEFAULT 0
+		);
 	`)
 	return err
+}
+
+func upsertChat(db *sql.DB, jid, name string, isGroup bool) {
+	grp := 0
+	if isGroup {
+		grp = 1
+	}
+	db.Exec(`INSERT INTO wa_chats (jid, name, is_group) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET name = excluded.name`,
+		jid, name, grp)
 }
 
 func storeMessage(db *sql.DB, id, chatJID, senderJID string, ts time.Time,
