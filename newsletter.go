@@ -10,7 +10,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -223,7 +222,7 @@ func (cli *Client) sendMexIQ(ctx context.Context, queryID string, variables any)
 		}
 		data, err := decoder.ArgoToMap(wt)
 		if err != nil {
-			log.Fatalf("argo to map error: %v", err)
+			return nil, fmt.Errorf("argo to map error: %w", err)
 		}
 		b, err := json.Marshal(data)
 		if err != nil {
